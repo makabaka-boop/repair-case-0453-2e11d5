@@ -76,7 +76,17 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
 	cfg.MaxConns = 10
-	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+	// Correctness depends on READ COMMITTED: every statement takes a fresh
+	// snapshot, so once SELECT ... FOR UPDATE is granted on the batch row,
+	// later statements in the same transaction observe whatever the lock
+	// predecessor committed while this transaction waited. Under REPEATABLE
+	// READ the snapshot would be fixed at the first statement - before the
+	// lock is granted - so chunks committed by the predecessor would stay
+	// invisible: a retransmission would be misjudged as absent and reinserted
+	// (unique violation surfacing as 500), and a seal would report gaps for
+	// a fully written batch. Writers still serialise on the batch row lock,
+	// so check-then-insert cannot race.
+	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "read committed"
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect database: %w", err)

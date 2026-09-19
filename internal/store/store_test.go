@@ -11,6 +11,7 @@ import (
 
 	"batchseal/internal/store"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -47,6 +48,21 @@ func ensureBasePool() bool {
 func newStore(ctx context.Context, t *testing.T) (s *store.Store, peer func() *store.Store) {
 	t.Helper()
 
+	schema := newSchema(ctx, t)
+	open := func() *store.Store {
+		st, err := store.New(ctx, schemaURL(schema))
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		return st
+	}
+	return open(), open
+}
+
+// newSchema creates a throwaway schema for one test and drops it afterwards.
+func newSchema(ctx context.Context, t *testing.T) string {
+	t.Helper()
+
 	if !ensureBasePool() {
 		t.Skipf("real PostgreSQL not available at %q: %v", testURL(), basePoolErr)
 	}
@@ -60,15 +76,7 @@ func newStore(ctx context.Context, t *testing.T) (s *store.Store, peer func() *s
 		defer cancel()
 		_, _ = basePool.Exec(cleanupCtx, "DROP SCHEMA "+schema+" CASCADE")
 	})
-
-	open := func() *store.Store {
-		st, err := store.New(ctx, schemaURL(schema))
-		if err != nil {
-			t.Fatalf("open store: %v", err)
-		}
-		return st
-	}
-	return open(), open
+	return schema
 }
 
 func schemaURL(schema string) string {
@@ -493,5 +501,177 @@ func TestRestartConsistency(t *testing.T) {
 	}
 	if _, err := restarted.SealBatch(ctx, sealed.ID); err != nil {
 		t.Fatalf("repeated seal after restart should be idempotent: %v", err)
+	}
+}
+
+// openRawPool connects to the test schema directly, standing in for another
+// API instance whose transaction a test drives statement by statement.
+func openRawPool(ctx context.Context, t *testing.T, schema string) *pgxpool.Pool {
+	t.Helper()
+	pool, err := pgxpool.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatalf("open raw pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// lockBatchAndInsertChunk opens a raw transaction that locks the batch row
+// and inserts a chunk without committing - exactly what a concurrent
+// SubmitChunk on another instance looks like mid-flight. The returned xid
+// identifies the holder so waitForBlockedOnXid can prove a second transaction
+// is queued on the row lock.
+func lockBatchAndInsertChunk(ctx context.Context, t *testing.T, pool *pgxpool.Pool, batchID string, seq int, payload string) (pgx.Tx, uint64) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin holder: %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	if _, err := tx.Exec(ctx,
+		`SELECT expected_chunks FROM batches WHERE id = $1 FOR UPDATE`, batchID); err != nil {
+		t.Fatalf("holder lock batch: %v", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO chunks (batch_id, seq, payload) VALUES ($1, $2, $3)`,
+		batchID, seq, payload); err != nil {
+		t.Fatalf("holder insert chunk: %v", err)
+	}
+	var xid uint64
+	if err := tx.QueryRow(ctx, `SELECT txid_current()`).Scan(&xid); err != nil {
+		t.Fatalf("holder xid: %v", err)
+	}
+	return tx, xid
+}
+
+// waitForBlockedOnXid waits until some transaction is queued on the holder's
+// xid, proving the blocked statement - and with it the blocked transaction's
+// snapshot - started before the holder is allowed to commit.
+func waitForBlockedOnXid(ctx context.Context, t *testing.T, xid uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := basePool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_locks
+			 WHERE locktype = 'transactionid' AND NOT granted
+			   AND transactionid::text = $1`,
+			fmt.Sprint(xid)).Scan(&n); err != nil {
+			t.Fatalf("poll pg_locks: %v", err)
+		}
+		if n > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no transaction blocked on holder xid %d within 10s", xid)
+}
+
+// TestSubmitObservesChunkCommittedDuringLockWait forces the interleaving in
+// which another instance commits a chunk while this submit waits for the
+// batch row lock. Once the lock is granted, the submit must observe the
+// committed chunk: an identical payload returns the original acknowledgement
+// (Created == false), a different payload returns ErrConflict. A duplicate
+// insert must never escape as an internal error.
+func TestSubmitObservesChunkCommittedDuringLockWait(t *testing.T) {
+	ctx := context.Background()
+	schema := newSchema(ctx, t)
+	s, err := store.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	raw := openRawPool(ctx, t, schema)
+
+	cases := []struct {
+		name    string
+		payload string
+		wantErr error
+	}{
+		{"identical payload is the original acknowledgement", "same-bytes", nil},
+		{"different payload is a conflict", "DIFFERENT", store.ErrConflict},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := mustBatch(ctx, t, s, 1)
+			holder, xid := lockBatchAndInsertChunk(ctx, t, raw, b.ID, 1, "same-bytes")
+
+			type outcome struct {
+				res store.SubmitResult
+				err error
+			}
+			done := make(chan outcome, 1)
+			go func() {
+				res, err := s.SubmitChunk(ctx, b.ID, 1, []byte(tc.payload))
+				done <- outcome{res, err}
+			}()
+			// The submit's snapshot is fixed before the holder commits.
+			waitForBlockedOnXid(ctx, t, xid)
+			if err := holder.Commit(ctx); err != nil {
+				t.Fatalf("commit holder: %v", err)
+			}
+			got := <-done
+
+			if !errors.Is(got.err, tc.wantErr) {
+				t.Fatalf("submit after lock wait: got err=%v, want %v", got.err, tc.wantErr)
+			}
+			if tc.wantErr != nil {
+				return
+			}
+			if got.res.Created {
+				t.Fatalf("retransmission reported as a new write: %+v", got.res)
+			}
+			var storedAt time.Time
+			if err := raw.QueryRow(ctx,
+				`SELECT received_at FROM chunks WHERE batch_id = $1 AND seq = 1`,
+				b.ID).Scan(&storedAt); err != nil {
+				t.Fatalf("read stored ack: %v", err)
+			}
+			if !got.res.ReceivedAt.Equal(storedAt) {
+				t.Fatalf("acknowledgement is not the original: got %v, stored %v",
+					got.res.ReceivedAt, storedAt)
+			}
+		})
+	}
+}
+
+// TestSealObservesFinalChunkCommittedDuringLockWait forces the interleaving
+// in which the final chunk commits while the seal waits for the batch row
+// lock. Once the lock is granted, the seal must see the complete set and seal
+// atomically - never answer INCOMPLETE with gaps for a fully written batch.
+func TestSealObservesFinalChunkCommittedDuringLockWait(t *testing.T) {
+	ctx := context.Background()
+	schema := newSchema(ctx, t)
+	s, err := store.New(ctx, schemaURL(schema))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	raw := openRawPool(ctx, t, schema)
+
+	b := mustBatch(ctx, t, s, 1)
+	holder, xid := lockBatchAndInsertChunk(ctx, t, raw, b.ID, 1, "only")
+
+	type outcome struct {
+		snap *store.Snapshot
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		snap, err := s.SealBatch(ctx, b.ID)
+		done <- outcome{snap, err}
+	}()
+	// The seal's snapshot is fixed before the holder commits.
+	waitForBlockedOnXid(ctx, t, xid)
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatalf("commit holder: %v", err)
+	}
+	got := <-done
+
+	if got.err != nil {
+		t.Fatalf("seal after final chunk committed during lock wait: err=%v snap=%+v", got.err, got.snap)
+	}
+	if got.snap.Status != store.StatusSealed || got.snap.Received != 1 || len(got.snap.Gaps) != 0 {
+		t.Fatalf("unexpected seal verdict: %+v", got.snap)
 	}
 }
