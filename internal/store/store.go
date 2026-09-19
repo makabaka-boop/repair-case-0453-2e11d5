@@ -76,7 +76,14 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
 	cfg.MaxConns = 10
-	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+	// Transactions must run at the default READ COMMITTED. Every
+	// adjudication first locks the batch row, then reads; the post-lock
+	// statements have to observe whatever the previous lock holder
+	// committed while this transaction was waiting. A frozen snapshot
+	// (REPEATABLE READ) is taken at the first statement — the lock
+	// acquisition itself — so a lock waiter would miss the holder's
+	// committed chunks: retransmissions would degrade into duplicate-key
+	// errors and complete batches would be judged INCOMPLETE.
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect database: %w", err)
