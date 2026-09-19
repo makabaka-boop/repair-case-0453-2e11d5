@@ -1,0 +1,21 @@
+# Binaries and build artifacts
+/api
+/verify
+/bin/
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Local env / overrides
+.env
+*.local
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Go
+vendor/

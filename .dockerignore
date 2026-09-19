@@ -1,0 +1,16 @@
+# Keep the build context small and deterministic.
+.git
+.gitignore
+*.md
+.env
+*.local
+/bin
+/api
+/verify
+*.test
+*.out
+coverage.*
+.idea/
+.vscode/
+.DS_Store
+vendor/

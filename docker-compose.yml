@@ -1,0 +1,85 @@
+name: batchseal
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: batchseal
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d batchseal"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Container-side port is fixed; the published host port is overridable
+      # through API_PORT (default 8080). Only api1 publishes to the host.
+      API_PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@db:5432/batchseal?sslmode=disable
+    ports:
+      # Override with, e.g.: API_PORT=18080 docker compose up --build
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+    restart: unless-stopped
+
+  api2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      API_PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@db:5432/batchseal?sslmode=disable
+    # No host port mapping: api2 is reachable only over the internal network,
+    # which is exactly how the verify service talks to it.
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+    restart: unless-stopped
+
+  # One-shot acceptance service. Exits 0 on success, non-zero on failure.
+  # Reachability of both instances is proven purely over the internal network.
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/app/verify"]
+    environment:
+      API1_URL: http://api1:8080
+      API2_URL: http://api2:8080
+      VERIFY_PHASE: ${VERIFY_PHASE:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      api1:
+        condition: service_started
+      api2:
+        condition: service_started
+    networks:
+      - internal
+    volumes:
+      - verify-state:/verify-state
+    restart: "no"
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  db-data:
+  verify-state:
